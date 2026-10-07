@@ -7,6 +7,7 @@ ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
 RUNTIME="$ROOT/.runtime"
 elapsed() { local sec=$(($(date +%s)-MASHHAD_START_TS)); printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
+format_duration() { local sec="${1:-0}"; printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 fail() { echo "ERROR: $*" >&2; exit 2; }
 [[ "$EUID" == 0 ]] || fail 'Run as root inside the RunPod container.'
 command -v findmnt >/dev/null || fail 'Use the documented RunPod PyTorch Ubuntu image (findmnt missing).'
@@ -482,7 +483,7 @@ repo() {
   local url="$1" dir="$2" commit="$3"
   if [[ -d "$dir/.git" ]]; then
     [[ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ]] || fail "Tracked local changes in $dir. Save them before installing this pinned version."
-    [[ "$(git -C "$dir" rev-parse HEAD)" == "$commit" ]] && return 0
+    [[ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" == "$commit" ]] && return 0
   elif [[ -e "$dir" ]]; then
     fail "$dir exists but is not a Git repository; move it manually before retrying."
   else
@@ -493,23 +494,7 @@ repo() {
   git -C "$dir" fetch --depth 1 origin "$commit"
   git -C "$dir" checkout --detach "$commit"
 }
-echo '[3/7] ComfyUI and LTXVideo (fixed source revisions)...'
-COMFY="$ROOT/ComfyUI"
-repo https://github.com/comfyanonymous/ComfyUI.git "$COMFY" 651ca296a73cd21c12a57eb8741d52e40dc6528f
-repo https://github.com/Lightricks/ComfyUI-LTXVideo.git "$COMFY/custom_nodes/ComfyUI-LTXVideo" bf2ca0264f706db64cb8931155695ca481fc9d91
-venv "$ROOT/.venv-comfy"
-if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchvision, torchaudio, aiohttp, safetensors, transformers' >/dev/null 2>&1; then
-  uv pip install --python "$ROOT/.venv-comfy/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match -r "$ROOT/mashhad/helpers/comfy_requirements.lock"
-  uv pip check --python "$ROOT/.venv-comfy/bin/python"
-  printf '%s\n' "$VERSION" > "$ROOT/.comfy-env-version"
-fi
-echo '[4/7] Official LTX Python pipelines...'
-repo https://github.com/Lightricks/LTX-2.git "$ROOT/LTX-2" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
-# These standalone Python pipelines are separate from ComfyUI and not needed for these workflows.
-if [[ "${MASHHAD_INSTALL_PIPELINES:-0}" == 1 ]]; then
-  (cd "$ROOT/LTX-2"; uv sync --no-dev --extra natten)
-fi
-echo '[5/7] Hugging Face download environment...'
+echo '[3/7] Hugging Face download environment...'
 venv "$ROOT/.venv-tools"
 if ! "$ROOT/.venv-tools/bin/python" -c 'import huggingface_hub' >/dev/null 2>&1; then
   uv pip install --python "$ROOT/.venv-tools/bin/python" huggingface_hub==1.33.0
@@ -518,9 +503,142 @@ export HF_HOME="$ROOT/.hf-cache"
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_DOWNLOAD_TIMEOUT=120
 export HF_HUB_ETAG_TIMEOUT=30
-echo '[6/7] BF16 + INT8 + VAEs + upscalers + detail LoRA...'
-"$ROOT/.venv-tools/bin/python" -u "$ROOT/mashhad/helpers/models.py"
+
+MODEL_PID=''
+MODEL_LOG=''
+MODEL_STATUS_FILE=''
+parallel_cleanup_model_download() {
+  [[ -n "$MODEL_PID" ]] || return 0
+  if kill -0 "$MODEL_PID" 2>/dev/null; then
+    echo "[CLEANUP] Stopping background model download PID=$MODEL_PID..."
+    kill -TERM "$MODEL_PID" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$MODEL_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$MODEL_PID" 2>/dev/null; then
+      kill -KILL "$MODEL_PID" 2>/dev/null || true
+    fi
+  fi
+  wait "$MODEL_PID" 2>/dev/null || true
+  MODEL_PID=''
+}
+parallel_exit_cleanup() {
+  local rc=$?
+  trap - EXIT
+  parallel_cleanup_model_download
+  exit "$rc"
+}
+trap parallel_exit_cleanup EXIT
+trap 'echo "Interrupted; stopping parallel tasks..."; exit 130' INT
+trap 'echo "Terminated; stopping parallel tasks..."; exit 143' TERM
+
+PARALLEL_START_TS=$(date +%s)
+echo '[4/7] Parallel model download and ComfyUI/LTXVideo...'
+COMFY="$ROOT/ComfyUI"
+# models.py creates ComfyUI/model links after downloading. Prepare only the
+# repository shell now, then perform its network fetch/checkout in parallel.
+if [[ ! -d "$COMFY/.git" ]]; then
+  [[ ! -e "$COMFY" ]] || fail "$COMFY exists but is not a Git repository; move it manually before retrying."
+  mkdir -p "$COMFY"
+  git -C "$COMFY" init -q
+fi
+if ! git -C "$COMFY" remote get-url origin >/dev/null 2>&1; then
+  git -C "$COMFY" remote add origin https://github.com/comfyanonymous/ComfyUI.git
+fi
+
+MODEL_START_TS=$(date +%s)
+MODEL_RUN_ID=$(date +%Y%m%d_%H%M%S)
+MODEL_LOG="$ROOT/logs/models_download_${MODEL_RUN_ID}.log"
+MODEL_STATUS_FILE="$ROOT/logs/.models_download_${MODEL_RUN_ID}.status"
+rm -f -- "$MODEL_STATUS_FILE" "$MODEL_STATUS_FILE".tmp.*
+"$ROOT/.venv-tools/bin/python" -u -c '
+import os
+import runpy
+import sys
+import time
+import traceback
+
+script, status_file = sys.argv[1:3]
+sys.argv = [script]
+rc = 0
+try:
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as exc:
+    if exc.code is None:
+        rc = 0
+    elif isinstance(exc.code, int):
+        rc = exc.code
+    else:
+        print(exc.code, file=sys.stderr, flush=True)
+        rc = 1
+except BaseException:
+    traceback.print_exc()
+    rc = 1
+try:
+    status_tmp = f"{status_file}.tmp.{os.getpid()}"
+    with open(status_tmp, "w", encoding="ascii") as handle:
+        handle.write(f"{rc} {int(time.time())}\n")
+    os.replace(status_tmp, status_file)
+except BaseException:
+    traceback.print_exc()
+    rc = 74
+raise SystemExit(rc)
+' "$ROOT/mashhad/helpers/models.py" "$MODEL_STATUS_FILE" > >(tee -a "$MODEL_LOG") 2>&1 &
+MODEL_PID=$!
+echo "[PARALLEL] Model download started at $(date -Is). PID=$MODEL_PID"
+echo "[PARALLEL] Model download log: $MODEL_LOG"
+
+COMFY_START_TS=$(date +%s)
+echo "[PARALLEL] ComfyUI installation started at $(date -Is)."
+repo https://github.com/comfyanonymous/ComfyUI.git "$COMFY" 651ca296a73cd21c12a57eb8741d52e40dc6528f
+repo https://github.com/Lightricks/ComfyUI-LTXVideo.git "$COMFY/custom_nodes/ComfyUI-LTXVideo" bf2ca0264f706db64cb8931155695ca481fc9d91
+venv "$ROOT/.venv-comfy"
+if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchvision, torchaudio, aiohttp, safetensors, transformers' >/dev/null 2>&1; then
+  uv pip install --python "$ROOT/.venv-comfy/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match -r "$ROOT/mashhad/helpers/comfy_requirements.lock"
+  uv pip check --python "$ROOT/.venv-comfy/bin/python"
+  printf '%s\n' "$VERSION" > "$ROOT/.comfy-env-version"
+fi
+echo '[5/7] Official LTX Python pipelines...'
+repo https://github.com/Lightricks/LTX-2.git "$ROOT/LTX-2" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
+# These standalone Python pipelines are separate from ComfyUI and not needed for these workflows.
+if [[ "${MASHHAD_INSTALL_PIPELINES:-0}" == 1 ]]; then
+  (cd "$ROOT/LTX-2"; uv sync --no-dev --extra natten)
+fi
+COMFY_END_TS=$(date +%s)
+echo "[PARALLEL] ComfyUI completed in $(format_duration "$((COMFY_END_TS-COMFY_START_TS))")."
+
+echo '[6/7] Synchronize model download and create ComfyUI links...'
+if kill -0 "$MODEL_PID" 2>/dev/null; then
+  echo '[WAIT] ComfyUI ready. Waiting for model download...'
+fi
+if wait "$MODEL_PID"; then
+  MODEL_RC=0
+else
+  MODEL_RC=$?
+fi
+MODEL_PID=''
+MODEL_RECORDED_RC=''
+MODEL_END_TS=''
+if [[ -r "$MODEL_STATUS_FILE" ]]; then
+  read -r MODEL_RECORDED_RC MODEL_END_TS < "$MODEL_STATUS_FILE" || true
+fi
+[[ "$MODEL_END_TS" =~ ^[0-9]+$ ]] || MODEL_END_TS=$(date +%s)
+MODEL_DURATION=$((MODEL_END_TS-MODEL_START_TS))
+if (( MODEL_RC != 0 )); then
+  echo "ERROR: Model download failed with exit code $MODEL_RC after $(format_duration "$MODEL_DURATION"). See $MODEL_LOG" >&2
+  exit "$MODEL_RC"
+fi
+if [[ -n "$MODEL_RECORDED_RC" && "$MODEL_RECORDED_RC" != 0 ]]; then
+  echo "ERROR: Model download status reported exit code $MODEL_RECORDED_RC. See $MODEL_LOG" >&2
+  exit "$MODEL_RECORDED_RC"
+fi
+echo '[OK] Model download completed.'
+echo "[PARALLEL] Models completed in $(format_duration "$MODEL_DURATION")."
+PARALLEL_END_TS=$(date +%s)
+echo "[PARALLEL] Both parallel tasks completed in $(format_duration "$((PARALLEL_END_TS-PARALLEL_START_TS))")."
 echo '[7/7] Workflow installation and validation...'
+echo '[VALIDATION] Starting final validation...'
 WORKFLOW_DIR="$COMFY/user/default/workflows/Mashhad"
 mkdir -p "$WORKFLOW_DIR"
 for workflow in "$ROOT/mashhad/workflows/"*.json; do
