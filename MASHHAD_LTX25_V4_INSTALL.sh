@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mashhad LTX25 V4: BF16 + INT8, no MSR. Self-contained installer.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_FULL_NO_MSR_20261001'
+VERSION='MASHHAD_LTX25_V4_PARALLEL_REUSE_TORCH_20261008'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -593,10 +593,75 @@ COMFY_START_TS=$(date +%s)
 echo "[PARALLEL] ComfyUI installation started at $(date -Is)."
 repo https://github.com/comfyanonymous/ComfyUI.git "$COMFY" 651ca296a73cd21c12a57eb8741d52e40dc6528f
 repo https://github.com/Lightricks/ComfyUI-LTXVideo.git "$COMFY/custom_nodes/ComfyUI-LTXVideo" bf2ca0264f706db64cb8931155695ca481fc9d91
-venv "$ROOT/.venv-comfy"
+COMFY_VENV="$ROOT/.venv-comfy"
+COMFY_USE_BASE_TORCH=0
+if python3 - <<'PY'
+import sys
+import torch
+
+assert sys.version_info[:2] == (3, 12), sys.version
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+then
+  COMFY_USE_BASE_TORCH=1
+  if [[ -e "$COMFY_VENV" ]] && { [[ ! -x "$COMFY_VENV/bin/python" ]] || ! grep -Eqi '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' "$COMFY_VENV/pyvenv.cfg"; }; then
+    echo '[FAST PATH] Rebuilding ComfyUI environment to reuse matching PyTorch/CUDA from the RunPod image.'
+    rm -rf -- "$COMFY_VENV"
+  fi
+  if [[ ! -x "$COMFY_VENV/bin/python" ]]; then
+    uv venv --python "$(command -v python3)" --system-site-packages "$COMFY_VENV"
+  fi
+  echo '[FAST PATH] Reusing base torch 2.9.1+cu128 and CUDA libraries; skipping their multi-GB download.'
+else
+  if [[ -f "$COMFY_VENV/pyvenv.cfg" ]] && grep -Eqi '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' "$COMFY_VENV/pyvenv.cfg"; then
+    echo '[FALLBACK] Base PyTorch is incompatible; rebuilding an isolated ComfyUI environment.'
+    rm -rf -- "$COMFY_VENV"
+  fi
+  venv "$COMFY_VENV"
+fi
+install_full_comfy_environment() {
+  uv pip install --python "$COMFY_VENV/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match -r "$ROOT/mashhad/helpers/comfy_requirements.lock"
+  uv pip check --python "$COMFY_VENV/bin/python"
+}
+verify_comfy_environment() {
+  "$COMFY_VENV/bin/python" - <<'PY'
+import torch
+import torchvision
+import torchaudio
+import triton
+import aiohttp
+import safetensors
+import transformers
+
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchvision.__version__.startswith('0.24.1'), torchvision.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
+assert triton.__version__ == '3.5.1', triton.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+}
 if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchvision, torchaudio, aiohttp, safetensors, transformers' >/dev/null 2>&1; then
-  uv pip install --python "$ROOT/.venv-comfy/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match -r "$ROOT/mashhad/helpers/comfy_requirements.lock"
-  uv pip check --python "$ROOT/.venv-comfy/bin/python"
+  if (( COMFY_USE_BASE_TORCH )); then
+    COMFY_FAST_LOCK="$ROOT/mashhad/helpers/comfy_requirements.no-base-torch.lock"
+    grep -Ev '^(torch|torchaudio|torchvision|triton|nvidia-[^=]+)==' "$ROOT/mashhad/helpers/comfy_requirements.lock" > "$COMFY_FAST_LOCK"
+    echo '[FAST PATH] Installing only ComfyUI packages not already supplied by the base image.'
+    uv pip install --no-deps --python "$COMFY_VENV/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match -r "$COMFY_FAST_LOCK"
+    if ! verify_comfy_environment >/dev/null 2>&1; then
+      echo '[FAST PATH] Installing small missing PyTorch companion wheels without reinstalling torch/CUDA.'
+      uv pip install --no-deps --python "$COMFY_VENV/bin/python" --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match 'torchvision==0.24.1+cu128' 'torchaudio==2.9.1+cu128' 'triton==3.5.1'
+    fi
+    if ! verify_comfy_environment; then
+      echo '[FALLBACK] Base-package reuse validation failed; switching to the complete pinned environment.' >&2
+      rm -rf -- "$COMFY_VENV"
+      venv "$COMFY_VENV"
+      install_full_comfy_environment
+      verify_comfy_environment
+    fi
+  else
+    install_full_comfy_environment
+    verify_comfy_environment
+  fi
   printf '%s\n' "$VERSION" > "$ROOT/.comfy-env-version"
 fi
 echo '[5/7] Official LTX Python pipelines...'
