@@ -1,9 +1,10 @@
 {
   "name": "LTX-2.5 DIRECT PARALLEL FAST V2",
   "imageName": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404",
+  "category": "NVIDIA",
   "containerDiskInGb": 50,
   "volumeMountPath": "/workspace",
-  "ports": "8000/http,22/tcp",
+  "ports": ["8000/http", "22/tcp"],
   "env": {
     "MASHHAD_PREPARE_ENGINES": "direct",
     "MASHHAD_DEFAULT_ENGINE": "direct",
@@ -11,8 +12,13 @@
     "LTX_MODELS_DIR": "/workspace/LTX25-DIRECT/models",
     "MASHHAD_INSTALLER_REF": "codex/direct-parallel-fast-v2",
     "MASHHAD_DIRECT_PRELOAD": "1",
-    "MASHHAD_DIRECT_OFFLOAD": "auto"
+    "MASHHAD_DIRECT_OFFLOAD": "auto",
+    "MASHHAD_INSTALL_URL": "https://raw.githubusercontent.com/alworafi/MASHHAD_LTX25_V4_INSTALL/codex/direct-parallel-fast-v2/direct-parallel-fast-v2/install.sh"
   },
-  "dockerArgs": "bash -lc 'set -Eeuo pipefail; curl -fLsS --retry 5 https://raw.githubusercontent.com/alworafi/MASHHAD_LTX25_V4_INSTALL/codex/direct-parallel-fast-v2/direct-parallel-fast-v2/install.sh -o /tmp/ltx25-direct-v2.sh; chmod 700 /tmp/ltx25-direct-v2.sh; exec bash /tmp/ltx25-direct-v2.sh'",
-  "notes": "No custom image. Attach a Network Volume at /workspace. Exactly five BF16 weights are stored once in /workspace/LTX25-DIRECT/models."
+  "dockerStartCmd": [
+    "bash",
+    "-lc",
+    "set -Eeuo pipefail; ROOT=/workspace/LTX25-DIRECT; READY=\"$ROOT/.DIRECT_PARALLEL_FAST_V2_READY\"; START=\"$ROOT/start.sh\"; INSTALL=\"$ROOT/install.sh\"; export MASHHAD_START_TS=$(date +%s); if [ -f \"$READY\" ] && [ -x \"$START\" ]; then exec \"$START\"; fi; T=$(mktemp /tmp/ltx25-direct-v2.XXXXXX.sh); curl -fLsS --retry 5 --connect-timeout 30 \"$MASHHAD_INSTALL_URL\" -o \"$T\"; bash -n \"$T\"; mkdir -p \"$ROOT\"; mv \"$T\" \"$INSTALL\"; chmod 700 \"$INSTALL\"; exec bash \"$INSTALL\""
+  ],
+  "readme": "Direct-only LTX-2.5 BF16 on the official RunPod PyTorch image. Attach a Network Volume at /workspace. The first Pod installs the official pinned Lightricks runtime and downloads five model files in parallel. Later Pods reuse /workspace/LTX25-DIRECT without reinstalling Python, Torch, dependencies, or models. Exactly five BF16 weights are stored once in /workspace/LTX25-DIRECT/models. INT8 is not enabled."
 }
