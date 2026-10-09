@@ -20,6 +20,19 @@
 
 يعاد استخدام Torch 2.9.1 وCUDA 12.8 من صورة RunPod ولا ينزلهما المثبت مرة ثانية. يفشل التثبيت بوضوح إذا لم تجتز الصورة أو البطاقة فحص التوافق.
 
+## Runtime readiness truth
+
+The health response deliberately separates `service_ready`, `pipeline_ready`,
+`model_ready`, and `model_loaded_to_gpu`. Constructing the official lazy
+`DistilledPipeline` never claims that all weights are already resident in VRAM.
+`model_ready` becomes true only after a complete real generation succeeds.
+
+The official LTX component lifecycle loads stages on demand and disposes their
+parameters back to `meta`; this build therefore keeps the pipeline object and a
+warm CUDA allocator, and enables the official in-process RAM weight registry
+automatically only when system RAM is at least 96 GB. This accelerates later
+requests without falsely claiming full-GPU residency or risking ordinary Pods.
+
 ## Fast Resume
 
 عند توصيل نفس Network Volume إلى Pod جديد بالصورة نفسها، يتحقق `install.sh` من البيئة والبطاقة ثم يشغل `start.sh` مباشرة. لا يعيد تثبيت Python أو Torch أو مكتبات LTX، ولا يعيد تنزيل النماذج.

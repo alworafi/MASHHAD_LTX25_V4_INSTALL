@@ -64,7 +64,12 @@ class PipelineManager:
         self.model_state = "unloaded"
         self.model_error: str | None = None
         self.loaded_at: float | None = None
+        self.last_generation_completed_at: float | None = None
         self.offload_mode: str | None = None
+        self.system_ram_gb = _system_ram_gb()
+        self.cache_weights_in_ram = False
+        self.warm_allocator = False
+        self._generation_verified = False
         self._load_lock = threading.Lock()
         self._generation_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -78,12 +83,20 @@ class PipelineManager:
         device = torch.cuda.get_device_name(0) if available else None
         vram = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1) if available else None
         with self._state_lock:
+            pipeline_ready = self.pipeline is not None and self.model_state not in {"failed", "unloaded"}
+            allocated_gb = round(torch.cuda.memory_allocated(0) / 1024**3, 2) if available else 0.0
+            model_loaded_to_gpu = bool(self._active_job and allocated_gb >= 1.0)
             return {
                 "service_ready": True,
-                "model_ready": self.pipeline is not None and self.model_state == "ready",
+                "pipeline_ready": pipeline_ready,
+                # A lazy pipeline object is not proof that all official model
+                # components have loaded and executed successfully.
+                "model_ready": self._generation_verified,
+                "model_loaded_to_gpu": model_loaded_to_gpu,
                 "model_state": self.model_state,
                 "model_error": self.model_error,
-                "model_loaded_at_epoch": self.loaded_at,
+                "pipeline_initialized_at_epoch": self.loaded_at,
+                "last_generation_completed_at_epoch": self.last_generation_completed_at,
                 "active_job": self._active_job,
                 "queue_depth": self._queued,
                 "concurrency": 1,
@@ -92,15 +105,12 @@ class PipelineManager:
                 "quantization": None,
                 "int8_convrot": "not-tested-not-enabled",
                 "offload_mode": self.offload_mode,
-                "model_residency": (
-                    "gpu-resident"
-                    if self.offload_mode == "none"
-                    else "cpu-cached-layer-streaming"
-                    if self.offload_mode == "cpu"
-                    else "disk-streaming"
-                    if self.offload_mode == "disk"
-                    else "not-selected"
-                ),
+                "model_residency": "active-gpu-stage" if model_loaded_to_gpu else "on-demand-component-loading",
+                "pipeline_reused_between_requests": True,
+                "weights_cached_in_ram": self.cache_weights_in_ram and self._generation_verified,
+                "cuda_allocator_warm": self.warm_allocator,
+                "system_ram_gb": self.system_ram_gb,
+                "cuda_memory_allocated_gb": allocated_gb,
                 "model_directory": str(MODEL_DIR),
                 "model_files": len(MODEL_FILES),
                 "missing_files": missing,
@@ -138,8 +148,16 @@ class PipelineManager:
                 if not torch.cuda.is_available():
                     raise RuntimeError("CUDA is unavailable")
 
+                from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
+                from ltx_core.loader.registry import ModelRegistry
                 from ltx_pipelines.distilled import DistilledPipeline
                 from ltx_pipelines.utils.model_paths import ModelPaths
+
+                self.cache_weights_in_ram = _cache_weights_enabled(self.system_ram_gb)
+                self.warm_allocator = os.getenv("MASHHAD_DIRECT_WARM_ALLOCATOR", "1").strip().lower() not in {
+                    "0", "false", "no",
+                }
+                registry = ModelRegistry(cache_weights=self.cache_weights_in_ram, cache_models=True)
 
                 paths = ModelPaths.from_split(
                     transformer_path=str(MODEL_FILES["transformer"]),
@@ -153,10 +171,14 @@ class PipelineManager:
                     loras=(),
                     quantization=None,
                     offload_mode=self._selected_offload(),
+                    registry=registry,
+                    alloc_trim_strategy=(
+                        AllocatorTrimStrategy.DEFER if self.warm_allocator else AllocatorTrimStrategy.TRIM
+                    ),
                 )
                 self.pipeline = pipeline
                 with self._state_lock:
-                    self.model_state = "ready"
+                    self.model_state = "pipeline-initialized"
                     self.loaded_at = time.time()
             except Exception as exc:
                 with self._state_lock:
@@ -193,6 +215,8 @@ class PipelineManager:
                 if request.job_id in self._cancel_requested:
                     raise HTTPException(409, "Generation cancelled")
                 self.load()
+                with self._state_lock:
+                    self.model_state = "loading-and-generating"
 
                 from ltx_core.model.video_vae import get_video_chunks_number
                 from ltx_pipelines.utils.media_io import encode_video
@@ -220,6 +244,10 @@ class PipelineManager:
                 if request.job_id in self._cancel_requested:
                     output_path.unlink(missing_ok=True)
                     raise HTTPException(409, "Generation cancelled")
+                with self._state_lock:
+                    self._generation_verified = True
+                    self.last_generation_completed_at = time.time()
+                    self.model_state = "verified-idle"
                 return {
                     "status": "completed",
                     "output_path": str(output_path),
@@ -235,13 +263,38 @@ class PipelineManager:
                         "num_frames": result.num_frames,
                         "audio_enabled": request.audio_enabled,
                         "pipeline_reused": True,
+                        "weights_cached_in_ram": self.cache_weights_in_ram,
+                        "cuda_allocator_warm": self.warm_allocator,
                     },
                 }
         finally:
             with self._state_lock:
                 if self._active_job == request.job_id:
                     self._active_job = None
+                if self.model_state == "loading-and-generating":
+                    self.model_state = "verified-idle" if self._generation_verified else "pipeline-initialized"
                 self._cancel_requested.discard(request.job_id)
+
+
+def _system_ram_gb() -> float | None:
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return round(pages * page_size / 1024**3, 1)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _cache_weights_enabled(system_ram_gb: float | None) -> bool:
+    requested = os.getenv("MASHHAD_DIRECT_CACHE_WEIGHTS", "auto").strip().lower()
+    if requested in {"1", "true", "yes", "on"}:
+        return True
+    if requested in {"0", "false", "no", "off"}:
+        return False
+    if requested != "auto":
+        raise RuntimeError("MASHHAD_DIRECT_CACHE_WEIGHTS must be auto, 1, or 0")
+    minimum = float(os.getenv("MASHHAD_DIRECT_CACHE_WEIGHTS_MIN_RAM_GB", "96"))
+    return system_ram_gb is not None and system_ram_gb >= minimum
 
 
 def _dimensions(request: GenerateRequest) -> tuple[int, int]:
