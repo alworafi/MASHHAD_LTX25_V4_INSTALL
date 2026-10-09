@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Mashhad LTX25 V4: BF16 + INT8, no MSR. Self-contained installer.
+# Mashhad LTX25 V4: selection-aware Direct/ComfyUI installer, no MSR.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_PARALLEL_REUSE_TORCH_20261008'
+VERSION='MASHHAD_LTX25_V4_ENGINE_SELECT_20261009'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -9,6 +9,21 @@ RUNTIME="$ROOT/.runtime"
 elapsed() { local sec=$(($(date +%s)-MASHHAD_START_TS)); printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 format_duration() { local sec="${1:-0}"; printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 fail() { echo "ERROR: $*" >&2; exit 2; }
+PREPARE_MODE="${MASHHAD_PREPARE_ENGINES:-direct,comfyui}"
+PREPARE_MODE="${PREPARE_MODE,,}"
+PREPARE_MODE="${PREPARE_MODE// /}"
+case "$PREPARE_MODE" in
+  direct) WANT_DIRECT=1; WANT_COMFYUI=0 ;;
+  comfyui) WANT_DIRECT=0; WANT_COMFYUI=1 ;;
+  both|direct,comfyui|comfyui,direct) PREPARE_MODE='direct,comfyui'; WANT_DIRECT=1; WANT_COMFYUI=1 ;;
+  *) fail "MASHHAD_PREPARE_ENGINES must be direct, comfyui, or direct,comfyui (received: $PREPARE_MODE)." ;;
+esac
+DEFAULT_ENGINE="${MASHHAD_DEFAULT_ENGINE:-direct}"
+DEFAULT_ENGINE="${DEFAULT_ENGINE,,}"
+[[ "$DEFAULT_ENGINE" == direct || "$DEFAULT_ENGINE" == comfyui ]] || fail 'MASHHAD_DEFAULT_ENGINE must be direct or comfyui.'
+if [[ "$DEFAULT_ENGINE" == direct && "$WANT_DIRECT" != 1 ]]; then DEFAULT_ENGINE='comfyui'; fi
+if [[ "$DEFAULT_ENGINE" == comfyui && "$WANT_COMFYUI" != 1 ]]; then DEFAULT_ENGINE='direct'; fi
+COMFY_AUTO_START="${MASHHAD_COMFYUI_AUTO_START:-0}"
 [[ "$EUID" == 0 ]] || fail 'Run as root inside the RunPod container.'
 command -v findmnt >/dev/null || fail 'Use the documented RunPod PyTorch Ubuntu image (findmnt missing).'
 SRC=$(findmnt -T /workspace -n -o SOURCE 2>/dev/null || true)
@@ -17,6 +32,7 @@ FSTYPE=$(findmnt -T /workspace -n -o FSTYPE 2>/dev/null || true)
 mkdir -p "$ROOT/logs" "$ROOT/models/ltx-2.5" "$RUNTIME"
 exec 9>"$ROOT/.mashhad-install.lock"
 flock -n 9 || fail 'Another Mashhad install/start process is using this volume.'
+rm -f -- "$ROOT/.MASHHAD_READY_V4"
 LOG="$ROOT/logs/install_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
 printf '%s\n' "$LOG" > "$ROOT/logs/current_install_log"
@@ -24,6 +40,7 @@ printf '%s\n' "$MASHHAD_START_TS" > "$ROOT/logs/current_start_ts"
 trap 'rc=$?; echo "FAILED at line $LINENO; exit=$rc; elapsed=$(elapsed); log=$LOG"; exit "$rc"' ERR
 echo "=== $VERSION ==="
 echo "Start: $(date -Is) | persistent filesystem: $SRC ($FSTYPE)"
+echo "Requested engines: $PREPARE_MODE | default: $DEFAULT_ENGINE | ComfyUI auto-start: $COMFY_AUTO_START"
 echo 'No MSR is installed. Existing unrelated custom nodes are preserved.'
 [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN="$(printf '%s' "$HF_TOKEN" | tr -d '\r\n')"
 echo '[1/7] System runtime packages...'
@@ -467,10 +484,23 @@ eev5F5fCF2fHT4+g8PMjGNnh58dHSVcA1JPjw9bJvvD0kO1T87fOoJXzHVYtGZ3w5RdHrIj1dwj/
 f8IiMBkYT85OL8/h5z5AeX45evXL1sXRvnB43rpgCHl2fnayv8PQCW+c8UbgvdOjpBWGamFqRqAK
 +/3y4mjUoPD06PAY2rpgLzMQh5W3xvz2s/1sP9vP9rP9bD/bz/az/Ww/28+H+fl/QfR0rwBwAwA=
 MASHHAD_PAYLOAD
-cp "$ROOT/mashhad/helpers/START_COMFYUI.sh" "$ROOT/START_COMFYUI.sh"
+cp "$ROOT/mashhad/helpers/START_COMFYUI.sh" "$ROOT/START_COMFYUI_ENGINE.sh"
 cp "$ROOT/mashhad/helpers/MONITOR_DOWNLOAD.sh" "$ROOT/MONITOR_DOWNLOAD.sh"
 cp "$ROOT/mashhad/helpers/DOWNLOAD_DEV_FOR_TRAINING.sh" "$ROOT/DOWNLOAD_DEV_FOR_TRAINING.sh"
-chmod +x "$ROOT/START_COMFYUI.sh" "$ROOT/MONITOR_DOWNLOAD.sh" "$ROOT/DOWNLOAD_DEV_FOR_TRAINING.sh"
+cat > "$ROOT/START_COMFYUI.sh" <<'MASHHAD_START_WRAPPER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
+DEFAULT_ENGINE="$(cat "$ROOT/.mashhad/default_engine" 2>/dev/null || printf direct)"
+COMFY_AUTO_START="$(cat "$ROOT/.mashhad/comfyui_auto_start" 2>/dev/null || printf 0)"
+if [[ -f "$ROOT/.mashhad/engines/comfyui.ready" ]] \
+  && { [[ "$DEFAULT_ENGINE" == comfyui ]] || [[ "$COMFY_AUTO_START" == 1 ]]; }; then
+  exec "$ROOT/START_COMFYUI_ENGINE.sh"
+fi
+echo "Mashhad environment is installed; ComfyUI auto-start is disabled for engine: $DEFAULT_ENGINE"
+exec tail -f /dev/null
+MASHHAD_START_WRAPPER
+chmod +x "$ROOT/START_COMFYUI.sh" "$ROOT/START_COMFYUI_ENGINE.sh" "$ROOT/MONITOR_DOWNLOAD.sh" "$ROOT/DOWNLOAD_DEV_FOR_TRAINING.sh"
 venv() {
   local dir="$1"
   if [[ -e "$dir" ]] && ! "$dir/bin/python" -c 'import sys' >/dev/null 2>&1; then
@@ -491,6 +521,9 @@ repo() {
     git -C "$dir" init -q
     git -C "$dir" remote add origin "$url"
   fi
+  if ! git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    git -C "$dir" remote add origin "$url"
+  fi
   git -C "$dir" fetch --depth 1 origin "$commit"
   git -C "$dir" checkout --detach "$commit"
 }
@@ -503,6 +536,38 @@ export HF_HOME="$ROOT/.hf-cache"
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_DOWNLOAD_TIMEOUT=120
 export HF_HUB_ETAG_TIMEOUT=30
+SELECTED_MODEL_MANIFEST="$ROOT/mashhad/helpers/models.selected.json"
+"$ROOT/.venv-tools/bin/python" - "$ROOT/mashhad/helpers/models.json" "$SELECTED_MODEL_MANIFEST" "$PREPARE_MODE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source, target, mode = sys.argv[1:]
+models = json.loads(Path(source).read_text(encoding="utf-8"))
+direct_paths = {
+    "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+    "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "vae/ltx-2.5-video-vae-bf16.safetensors",
+    "vae/ltx-2.5-audio-vae-bf16.safetensors",
+    "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+}
+comfy_paths = {
+    "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+    "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+    "vae/ltx-2.5-video-vae-bf16.safetensors",
+    "vae/ltx-2.5-audio-vae-bf16.safetensors",
+    "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
+    "loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors",
+}
+wanted = (direct_paths if mode == "direct" else comfy_paths if mode == "comfyui" else direct_paths | comfy_paths)
+selected = [item for item in models if item["path"] in wanted]
+missing = sorted(wanted - {item["path"] for item in selected})
+if missing:
+    raise SystemExit(f"Selected model manifest is incomplete: {missing}")
+Path(target).write_text(json.dumps(selected, indent=2) + "\n", encoding="utf-8")
+print(f"Selected {len(selected)}/{len(models)} model files for {mode}: {sum(item['size'] for item in selected)/1e9:.2f} GB")
+PY
 
 MODEL_PID=''
 MODEL_LOG=''
@@ -534,17 +599,21 @@ trap 'echo "Interrupted; stopping parallel tasks..."; exit 130' INT
 trap 'echo "Terminated; stopping parallel tasks..."; exit 143' TERM
 
 PARALLEL_START_TS=$(date +%s)
-echo '[4/7] Parallel model download and ComfyUI/LTXVideo...'
+echo '[4/7] Parallel model download and selected engine runtime...'
 COMFY="$ROOT/ComfyUI"
 # models.py creates ComfyUI/model links after downloading. Prepare only the
 # repository shell now, then perform its network fetch/checkout in parallel.
-if [[ ! -d "$COMFY/.git" ]]; then
-  [[ ! -e "$COMFY" ]] || fail "$COMFY exists but is not a Git repository; move it manually before retrying."
-  mkdir -p "$COMFY"
-  git -C "$COMFY" init -q
-fi
-if ! git -C "$COMFY" remote get-url origin >/dev/null 2>&1; then
-  git -C "$COMFY" remote add origin https://github.com/comfyanonymous/ComfyUI.git
+if (( WANT_COMFYUI )); then
+  if [[ ! -d "$COMFY/.git" ]]; then
+    if [[ -e "$COMFY" ]] && find "$COMFY" -mindepth 1 -maxdepth 1 ! -name models -print -quit | grep -q .; then
+      fail "$COMFY exists but is not a Git repository; move it manually before retrying."
+    fi
+    mkdir -p "$COMFY"
+    git -C "$COMFY" init -q
+  fi
+  if ! git -C "$COMFY" remote get-url origin >/dev/null 2>&1; then
+    git -C "$COMFY" remote add origin https://github.com/comfyanonymous/ComfyUI.git
+  fi
 fi
 
 MODEL_START_TS=$(date +%s)
@@ -559,8 +628,8 @@ import sys
 import time
 import traceback
 
-script, status_file = sys.argv[1:3]
-sys.argv = [script]
+script, status_file, manifest = sys.argv[1:4]
+sys.argv = [script, "--manifest", manifest]
 rc = 0
 try:
     runpy.run_path(script, run_name="__main__")
@@ -584,12 +653,13 @@ except BaseException:
     traceback.print_exc()
     rc = 74
 raise SystemExit(rc)
-' "$ROOT/mashhad/helpers/models.py" "$MODEL_STATUS_FILE" > >(tee -a "$MODEL_LOG") 2>&1 &
+' "$ROOT/mashhad/helpers/models.py" "$MODEL_STATUS_FILE" "$SELECTED_MODEL_MANIFEST" > >(tee -a "$MODEL_LOG") 2>&1 &
 MODEL_PID=$!
 echo "[PARALLEL] Model download started at $(date -Is). PID=$MODEL_PID"
 echo "[PARALLEL] Model download log: $MODEL_LOG"
 
 COMFY_START_TS=$(date +%s)
+if (( WANT_COMFYUI )); then
 echo "[PARALLEL] ComfyUI installation started at $(date -Is)."
 repo https://github.com/comfyanonymous/ComfyUI.git "$COMFY" 651ca296a73cd21c12a57eb8741d52e40dc6528f
 repo https://github.com/Lightricks/ComfyUI-LTXVideo.git "$COMFY/custom_nodes/ComfyUI-LTXVideo" bf2ca0264f706db64cb8931155695ca481fc9d91
@@ -664,14 +734,21 @@ if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] |
   fi
   printf '%s\n' "$VERSION" > "$ROOT/.comfy-env-version"
 fi
-echo '[5/7] Official LTX Python pipelines...'
-repo https://github.com/Lightricks/LTX-2.git "$ROOT/LTX-2" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
-# These standalone Python pipelines are separate from ComfyUI and not needed for these workflows.
-if [[ "${MASHHAD_INSTALL_PIPELINES:-0}" == 1 ]]; then
-  (cd "$ROOT/LTX-2"; uv sync --no-dev --extra natten)
-fi
 COMFY_END_TS=$(date +%s)
 echo "[PARALLEL] ComfyUI completed in $(format_duration "$((COMFY_END_TS-COMFY_START_TS))")."
+else
+  echo '[SKIP] ComfyUI was not selected.'
+fi
+
+echo '[5/7] Selected engine runtime...'
+if (( WANT_DIRECT )); then
+  echo "[PARALLEL] Direct Python installation started at $(date -Is)."
+  repo https://github.com/Lightricks/LTX-2.git "$ROOT/LTX-2" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
+  (cd "$ROOT/LTX-2"; uv sync --no-dev --extra natten)
+  echo '[PARALLEL] Direct Python runtime completed.'
+else
+  echo '[SKIP] Direct Python was not selected.'
+fi
 
 echo '[6/7] Synchronize model download and create ComfyUI links...'
 if kill -0 "$MODEL_PID" 2>/dev/null; then
@@ -705,20 +782,29 @@ echo "[PARALLEL] Both parallel tasks completed in $(format_duration "$((PARALLEL
 echo '[7/7] Workflow installation and validation...'
 echo '[VALIDATION] Starting final validation...'
 WORKFLOW_DIR="$COMFY/user/default/workflows/Mashhad"
-mkdir -p "$WORKFLOW_DIR"
-for workflow in "$ROOT/mashhad/workflows/"*.json; do
-  name=$(basename "$workflow")
-  if [[ -e "$WORKFLOW_DIR/$name" ]] && ! cmp -s "$workflow" "$WORKFLOW_DIR/$name"; then
-    cp "$WORKFLOW_DIR/$name" "$WORKFLOW_DIR/${name%.json}.backup_$(date +%Y%m%d_%H%M%S).json"
-  fi
-  cp "$workflow" "$WORKFLOW_DIR/$name"
-done
-"$ROOT/.venv-tools/bin/python" "$ROOT/mashhad/helpers/models.py" --check
+if (( WANT_COMFYUI )); then
+  mkdir -p "$WORKFLOW_DIR"
+  for workflow in "$ROOT/mashhad/workflows/"*.json; do
+    name=$(basename "$workflow")
+    if [[ -e "$WORKFLOW_DIR/$name" ]] && ! cmp -s "$workflow" "$WORKFLOW_DIR/$name"; then
+      cp "$WORKFLOW_DIR/$name" "$WORKFLOW_DIR/${name%.json}.backup_$(date +%Y%m%d_%H%M%S).json"
+    fi
+    cp "$workflow" "$WORKFLOW_DIR/$name"
+  done
+fi
+"$ROOT/.venv-tools/bin/python" "$ROOT/mashhad/helpers/models.py" --check --manifest "$SELECTED_MODEL_MANIFEST"
+mkdir -p "$ROOT/.mashhad/engines"
+rm -f -- "$ROOT/.mashhad/engines/direct.ready" "$ROOT/.mashhad/engines/comfyui.ready"
+if (( WANT_DIRECT )); then printf '%s\n' "$VERSION" > "$ROOT/.mashhad/engines/direct.ready"; fi
+if (( WANT_COMFYUI )); then printf '%s\n' "$VERSION" > "$ROOT/.mashhad/engines/comfyui.ready"; fi
+printf '%s\n' "$PREPARE_MODE" > "$ROOT/.mashhad/prepared_engines"
+printf '%s\n' "$DEFAULT_ENGINE" > "$ROOT/.mashhad/default_engine"
+printf '%s\n' "$COMFY_AUTO_START" > "$ROOT/.mashhad/comfyui_auto_start"
 printf '%s\n' "$VERSION" > "$ROOT/.MASHHAD_READY_V4"
 echo "INSTALL VERIFIED in $(elapsed)"
 du -sh "$ROOT"
 echo "Monitor in another terminal: bash $ROOT/MONITOR_DOWNLOAD.sh"
-echo "Workflows: $WORKFLOW_DIR"
+if (( WANT_COMFYUI )); then echo "Workflows: $WORKFLOW_DIR"; fi
 echo "Install log: $LOG"
 if [[ "${MASHHAD_INSTALL_ONLY:-0}" == 1 ]]; then
   echo 'INSTALL ONLY complete. For generation: use a GPU pod on this volume and set MASHHAD_INSTALL_ONLY=0.'
