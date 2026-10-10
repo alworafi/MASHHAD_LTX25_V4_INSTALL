@@ -65,7 +65,9 @@ export WORKER_INPUT_DIR="$ROOT/inputs"
 export WORKER_OUTPUT_DIR="$ROOT/outputs"
 export PATH="$RUNTIME/bin:$ROOT/bin:$PATH"
 export UV_CACHE_DIR="$RUNTIME/uv-cache"
-export UV_LINK_MODE=copy
+# The cache and venv share the persistent Volume, so linking avoids a second
+# network-filesystem copy of packages while keeping resume behavior intact.
+export UV_LINK_MODE=hardlink
 export HF_HUB_DISABLE_XET=0
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-600}"

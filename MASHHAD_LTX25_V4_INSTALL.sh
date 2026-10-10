@@ -63,7 +63,9 @@ fi
 export PATH="$RUNTIME/bin:$PATH"
 export UV_PYTHON_INSTALL_DIR="$RUNTIME/python"
 export UV_CACHE_DIR="$RUNTIME/uv-cache"
-export UV_LINK_MODE=copy
+# The uv cache and persistent environments share one RunPod Volume. Hardlinks
+# avoid copying multi-GB Torch/CUDA trees across the network filesystem.
+export UV_LINK_MODE=hardlink
 uv python install 3.12
 # Embedded helpers, model manifest and both workflows. No separate GitHub downloads.
 base64 -d <<'MASHHAD_PAYLOAD' | tar -xz -C "$ROOT/mashhad"
@@ -601,8 +603,8 @@ trap 'echo "Terminated; stopping parallel tasks..."; exit 143' TERM
 PARALLEL_START_TS=$(date +%s)
 echo '[4/7] Parallel model download and selected engine runtime...'
 COMFY="$ROOT/ComfyUI"
-# models.py creates ComfyUI/model links after downloading. Prepare only the
-# repository shell now, then perform its network fetch/checkout in parallel.
+# models.py may create zero-copy compatibility links after downloading. Prepare
+# the ComfyUI repository shell only when that runtime was explicitly selected.
 if (( WANT_COMFYUI )); then
   if [[ ! -d "$COMFY/.git" ]]; then
     if [[ -e "$COMFY" ]] && find "$COMFY" -mindepth 1 -maxdepth 1 ! -name models -print -quit | grep -q .; then
@@ -750,9 +752,13 @@ else
   echo '[SKIP] Direct Python was not selected.'
 fi
 
-echo '[6/7] Synchronize model download and create ComfyUI links...'
+if (( WANT_COMFYUI )); then
+  echo '[6/7] Synchronize model download and create ComfyUI links...'
+else
+  echo '[6/7] Synchronize Direct model download...'
+fi
 if kill -0 "$MODEL_PID" 2>/dev/null; then
-  echo '[WAIT] ComfyUI ready. Waiting for model download...'
+  echo '[WAIT] Selected runtime ready. Waiting for model download...'
 fi
 if wait "$MODEL_PID"; then
   MODEL_RC=0
@@ -776,6 +782,9 @@ if [[ -n "$MODEL_RECORDED_RC" && "$MODEL_RECORDED_RC" != 0 ]]; then
   exit "$MODEL_RECORDED_RC"
 fi
 echo '[OK] Model download completed.'
+if (( ! WANT_COMFYUI )); then
+  echo '[INFO] Direct-only mode: compatibility links do not install or duplicate ComfyUI models.'
+fi
 echo "[PARALLEL] Models completed in $(format_duration "$MODEL_DURATION")."
 PARALLEL_END_TS=$(date +%s)
 echo "[PARALLEL] Both parallel tasks completed in $(format_duration "$((PARALLEL_END_TS-PARALLEL_START_TS))")."
