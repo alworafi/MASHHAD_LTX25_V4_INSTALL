@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Mashhad LTX25 V4: selection-aware Direct/ComfyUI installer, no MSR.
+# Mashhad LTX25 V5: selection-aware Direct/ComfyUI installer, public ComfyUI port, no MSR.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_DUAL_LOCAL_RUNTIME_CACHE_20261011'
+VERSION='MASHHAD_LTX25_V5_DUAL_LOCAL_RUNTIME_PUBLIC_COMFY_8188_20261011'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -516,6 +516,7 @@ set -Eeuo pipefail
 ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 LOCAL_RUNTIME_PARENT="${MASHHAD_LOCAL_RUNTIME_PARENT:-/opt/mashhad-ltx25}"
 COMFY="$LOCAL_RUNTIME_PARENT/ComfyUI"
+COMFYUI_LISTEN="${COMFYUI_LISTEN:-0.0.0.0}"
 if [[ ! -x "$COMFY/.venv/bin/python" ]]; then
   bash "$ROOT/RESTORE_COMFY_RUNTIME.sh"
 fi
@@ -525,7 +526,7 @@ fi
 }
 mkdir -p "$ROOT/comfy-user"
 exec "$COMFY/.venv/bin/python" "$COMFY/main.py" \
-  --listen 127.0.0.1 \
+  --listen "$COMFYUI_LISTEN" \
   --port "${COMFYUI_PORT:-8188}" \
   --disable-auto-launch \
   --user-directory "$ROOT/comfy-user" \
