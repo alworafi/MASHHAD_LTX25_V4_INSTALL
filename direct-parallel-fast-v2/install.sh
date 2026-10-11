@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="LTX25_DIRECT_PARALLEL_FAST_V2_20261009_1"
+VERSION="LTX25_DIRECT_PARALLEL_FAST_V2_20261011_1"
 ROOT="${MASHHAD_LTX_ROOT:-/workspace/LTX25-DIRECT}"
 STATE="$ROOT/.mashhad"
 RUNTIME="$ROOT/.runtime"
@@ -117,10 +117,11 @@ fi
 [[ -x "$BASE_PYTHON" ]] || fail "The RunPod base-image Python 3.12 was not found at $BASE_PYTHON."
 base_probe="$($BASE_PYTHON - <<'PY'
 import torch
-print(f"{torch.__version__}|{torch.version.cuda}")
+import torchaudio
+print(f"{torch.__version__}|{torch.version.cuda}|{torchaudio.__version__}")
 PY
 )"
-[[ "$base_probe" == 2.9.1*"|12.8"* ]] || fail "Base Torch/CUDA mismatch: $base_probe"
+[[ "$base_probe" == 2.9.1*"|12.8|2.9.1"* ]] || fail "Base Torch/CUDA companions mismatch: $base_probe"
 echo "[REUSE] Base runtime accepted: Python=$($BASE_PYTHON -V 2>&1), Torch/CUDA=$base_probe"
 
 echo "[3/6] Preparing the lightweight downloader, then starting all five files in parallel..."
@@ -142,20 +143,35 @@ echo "[4/6] Installing the official pinned Direct runtime in parallel with model
   git -C "$LTX_REPO" fetch --depth 1 origin "$LTX_COMMIT"
   git -C "$LTX_REPO" checkout --detach --force "$LTX_COMMIT"
 
+  if [[ -e "$VENV" ]] && { \
+    [[ ! -x "$VENV/bin/python" ]] \
+    || ! grep -Eqi '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' "$VENV/pyvenv.cfg" \
+    || ! "$VENV/bin/python" -c "import torch; assert torch.__version__ == '2.9.1+cu128'" >/dev/null 2>&1; \
+  }; then
+    echo "[REPAIR] Rebuilding the Direct venv because it shadows the base Torch/CUDA runtime."
+    rm -rf -- "$VENV"
+  fi
   if [[ ! -x "$VENV/bin/python" ]]; then
     "$BASE_PYTHON" -m venv --system-site-packages "$VENV"
   fi
-  uv pip install --python "$VENV/bin/python" \
+  if ! "$VENV/bin/python" -c "import torchvision; assert torchvision.__version__.startswith('0.24.1')" >/dev/null 2>&1; then
+    echo "[REUSE] Installing the matching torchvision companion without Torch/CUDA dependencies."
+    uv pip install --no-deps --python "$VENV/bin/python" \
+      --index-url https://download.pytorch.org/whl/cu128 "torchvision==0.24.1+cu128"
+  fi
+  PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install \
     -e "$LTX_REPO/packages/ltx-core" \
     -e "$LTX_REPO/packages/ltx-pipelines" \
     "fastapi==0.118.0" "uvicorn[standard]==0.37.0" "httpx==0.28.1" \
     "pydantic==2.11.9" "python-multipart==0.0.20" "imageio-ffmpeg>=0.6,<1"
-  uv pip install --python "$VENV/bin/python" --no-deps \
-    "natten==0.21.5+torch290cu128" -f https://whl.natten.org
+  PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install --no-deps \
+    "natten==0.21.5+torch290cu128" --find-links https://whl.natten.org
 
   runtime_probe="$($VENV/bin/python - <<'PY'
 import torch
+import torchvision
 assert torch.__version__.startswith("2.9.1"), torch.__version__
+assert torchvision.__version__.startswith("0.24.1"), torchvision.__version__
 assert (torch.version.cuda or "").startswith("12.8"), torch.version.cuda
 print(f"{torch.__version__}|{torch.version.cuda}")
 PY

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mashhad LTX25 V4: selection-aware Direct/ComfyUI installer, no MSR.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_ENGINE_SELECT_20261009'
+VERSION='MASHHAD_LTX25_V4_ENGINE_SELECT_20261011'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -670,9 +670,11 @@ COMFY_USE_BASE_TORCH=0
 if python3 - <<'PY'
 import sys
 import torch
+import torchaudio
 
 assert sys.version_info[:2] == (3, 12), sys.version
 assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
 assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
 PY
 then
@@ -745,8 +747,89 @@ fi
 echo '[5/7] Selected engine runtime...'
 if (( WANT_DIRECT )); then
   echo "[PARALLEL] Direct Python installation started at $(date -Is)."
-  repo https://github.com/Lightricks/LTX-2.git "$ROOT/LTX-2" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
-  (cd "$ROOT/LTX-2"; uv sync --no-dev --extra natten)
+  DIRECT_REPO="$ROOT/LTX-2"
+  DIRECT_VENV="$DIRECT_REPO/.venv"
+  repo https://github.com/Lightricks/LTX-2.git "$DIRECT_REPO" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
+  DIRECT_USE_BASE_TORCH=0
+  if python3 - <<'PY'
+import sys
+import torch
+
+assert sys.version_info[:2] == (3, 12), sys.version
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+  then
+    DIRECT_USE_BASE_TORCH=1
+    if [[ -e "$DIRECT_VENV" ]] && { \
+      [[ ! -x "$DIRECT_VENV/bin/python" ]] \
+      || ! grep -Eqi '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' "$DIRECT_VENV/pyvenv.cfg" \
+      || ! "$DIRECT_VENV/bin/python" -c "import torch; assert torch.__version__ == '2.9.1+cu128'" >/dev/null 2>&1; \
+    }; then
+      echo '[FAST PATH] Rebuilding Direct environment to reuse matching PyTorch/CUDA from the RunPod image.'
+      rm -rf -- "$DIRECT_VENV"
+    fi
+    if [[ ! -x "$DIRECT_VENV/bin/python" ]]; then
+      python3 -m venv --system-site-packages "$DIRECT_VENV"
+    fi
+    echo '[FAST PATH] Reusing base torch 2.9.1+cu128 and CUDA libraries; skipping their multi-GB download.'
+  else
+    if [[ -f "$DIRECT_VENV/pyvenv.cfg" ]] && grep -Eqi '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' "$DIRECT_VENV/pyvenv.cfg"; then
+      echo '[FALLBACK] Base PyTorch is incompatible; rebuilding an isolated Direct environment.'
+      rm -rf -- "$DIRECT_VENV"
+    fi
+  fi
+  install_full_direct_environment() {
+    rm -rf -- "$DIRECT_VENV"
+    (cd "$DIRECT_REPO"; uv sync --no-dev --extra natten)
+  }
+  verify_direct_environment() {
+    "$DIRECT_VENV/bin/python" - <<'PY'
+import natten
+import torch
+import torchaudio
+import torchvision
+from ltx_pipelines import __path__ as ltx_pipelines_path
+
+assert ltx_pipelines_path
+assert torch.version.cuda, torch.version.cuda
+PY
+  }
+  verify_direct_fast_environment() {
+    verify_direct_environment
+    "$DIRECT_VENV/bin/python" - <<'PY'
+import torch
+
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+  }
+  if [[ "$(cat "$ROOT/.direct-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! verify_direct_environment >/dev/null 2>&1; then
+    if (( DIRECT_USE_BASE_TORCH )); then
+      echo '[FAST PATH] Installing Direct packages while keeping the base Torch/CUDA runtime.'
+      if ! "$DIRECT_VENV/bin/python" -c "import torchvision; assert torchvision.__version__.startswith('0.24.1')" >/dev/null 2>&1; then
+        echo '[FAST PATH] Installing the small matching torchvision companion without dependencies.'
+        uv pip install --no-deps --python "$DIRECT_VENV/bin/python" \
+          --index-url https://download.pytorch.org/whl/cu128 'torchvision==0.24.1+cu128'
+      fi
+      PIP_DISABLE_PIP_VERSION_CHECK=1 "$DIRECT_VENV/bin/python" -m pip install \
+        -e "$DIRECT_REPO/packages/ltx-core" \
+        -e "$DIRECT_REPO/packages/ltx-pipelines"
+      PIP_DISABLE_PIP_VERSION_CHECK=1 "$DIRECT_VENV/bin/python" -m pip install --no-deps \
+        'natten==0.21.5+torch290cu128' --find-links https://whl.natten.org
+      if ! verify_direct_fast_environment; then
+        echo '[FALLBACK] Base-package reuse validation failed; switching to the complete pinned Direct environment.' >&2
+        install_full_direct_environment
+        verify_direct_environment
+      fi
+    else
+      install_full_direct_environment
+      verify_direct_environment
+    fi
+    printf '%s\n' "$VERSION" > "$ROOT/.direct-env-version"
+  else
+    echo '[FAST RESUME] Verified Direct environment found; no Python package installation is needed.'
+  fi
   echo '[PARALLEL] Direct Python runtime completed.'
 else
   echo '[SKIP] Direct Python was not selected.'
