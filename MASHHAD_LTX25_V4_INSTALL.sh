@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Mashhad LTX25 V4: selection-aware Direct/ComfyUI installer, no MSR.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_ENGINE_SELECT_20261011'
+VERSION='MASHHAD_LTX25_V4_LOCAL_RUNTIME_CACHE_20261011'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
 RUNTIME="$ROOT/.runtime"
+LOCAL_RUNTIME_PARENT="${MASHHAD_LOCAL_RUNTIME_PARENT:-/opt/mashhad-ltx25}"
+LOCAL_DIRECT_REPO="$LOCAL_RUNTIME_PARENT/LTX-2"
+DIRECT_CACHE_DIR="$ROOT/runtime-cache"
+DIRECT_CACHE="$DIRECT_CACHE_DIR/direct-py312-torch291-cu128.tar.gz"
+DIRECT_CACHE_SHA="$DIRECT_CACHE.sha256"
 elapsed() { local sec=$(($(date +%s)-MASHHAD_START_TS)); printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 format_duration() { local sec="${1:-0}"; printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 fail() { echo "ERROR: $*" >&2; exit 2; }
@@ -529,6 +534,102 @@ repo() {
   git -C "$dir" fetch --depth 1 origin "$commit"
   git -C "$dir" checkout --detach "$commit"
 }
+validate_direct_runtime() {
+  local direct_repo="${1:-$LOCAL_DIRECT_REPO}"
+  [[ -x "$direct_repo/.venv/bin/python" ]] || return 1
+  "$direct_repo/.venv/bin/python" - <<'PY'
+import natten
+import torch
+import torchaudio
+import torchvision
+from ltx_pipelines import __path__ as ltx_pipelines_path
+
+assert ltx_pipelines_path
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchvision.__version__.startswith('0.24.1'), torchvision.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+}
+restore_direct_runtime() {
+  validate_direct_runtime "$LOCAL_DIRECT_REPO" >/dev/null 2>&1 && return 0
+  [[ -s "$DIRECT_CACHE" && -s "$DIRECT_CACHE_SHA" ]] || return 1
+  mkdir -p "$LOCAL_RUNTIME_PARENT"
+  (
+    cd "$DIRECT_CACHE_DIR"
+    sha256sum -c "$(basename "$DIRECT_CACHE_SHA")"
+  ) || return 1
+  rm -rf -- "$LOCAL_DIRECT_REPO"
+  tar -xzf "$DIRECT_CACHE" -C "$LOCAL_RUNTIME_PARENT"
+  validate_direct_runtime "$LOCAL_DIRECT_REPO"
+}
+cache_direct_runtime() {
+  local temporary="$DIRECT_CACHE.tmp.$$"
+  local temporary_sha="$DIRECT_CACHE_SHA.tmp.$$"
+  mkdir -p "$DIRECT_CACHE_DIR"
+  rm -f -- "$temporary" "$temporary_sha"
+  tar -czf "$temporary" -C "$LOCAL_RUNTIME_PARENT" LTX-2
+  printf '%s  %s\n' "$(sha256sum "$temporary" | awk '{print $1}')" "$(basename "$DIRECT_CACHE")" > "$temporary_sha"
+  mv -f "$temporary" "$DIRECT_CACHE"
+  mv -f "$temporary_sha" "$DIRECT_CACHE_SHA"
+  echo "[CACHE] Direct runtime archived for future Pods: $DIRECT_CACHE"
+}
+write_direct_restore_launcher() {
+  cat > "$ROOT/RESTORE_DIRECT_RUNTIME.sh" <<'MASHHAD_RESTORE_DIRECT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
+LOCAL_RUNTIME_PARENT="${MASHHAD_LOCAL_RUNTIME_PARENT:-/opt/mashhad-ltx25}"
+LOCAL_DIRECT_REPO="$LOCAL_RUNTIME_PARENT/LTX-2"
+DIRECT_CACHE_DIR="$ROOT/runtime-cache"
+DIRECT_CACHE="$DIRECT_CACHE_DIR/direct-py312-torch291-cu128.tar.gz"
+DIRECT_CACHE_SHA="$DIRECT_CACHE.sha256"
+validate() {
+  [[ -x "$LOCAL_DIRECT_REPO/.venv/bin/python" ]] || return 1
+  "$LOCAL_DIRECT_REPO/.venv/bin/python" - <<'PY'
+import natten
+import torch
+import torchaudio
+import torchvision
+from ltx_pipelines import __path__ as ltx_pipelines_path
+assert ltx_pipelines_path
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchvision.__version__.startswith('0.24.1'), torchvision.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+}
+if validate >/dev/null 2>&1; then
+  echo '[FAST RESTORE] Direct runtime is already ready on local disk.'
+  exit 0
+fi
+[[ -s "$DIRECT_CACHE" && -s "$DIRECT_CACHE_SHA" ]] || {
+  echo "Direct runtime cache is missing: $DIRECT_CACHE" >&2
+  exit 41
+}
+mkdir -p "$LOCAL_RUNTIME_PARENT"
+(
+  cd "$DIRECT_CACHE_DIR"
+  sha256sum -c "$(basename "$DIRECT_CACHE_SHA")"
+)
+rm -rf -- "$LOCAL_DIRECT_REPO"
+started=$(date +%s)
+tar -xzf "$DIRECT_CACHE" -C "$LOCAL_RUNTIME_PARENT"
+validate
+echo "[FAST RESTORE] Direct runtime restored to local disk in $(($(date +%s)-started))s."
+MASHHAD_RESTORE_DIRECT
+  chmod +x "$ROOT/RESTORE_DIRECT_RUNTIME.sh"
+  cat > "$ROOT/start_services.sh" <<'MASHHAD_START_SERVICES'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
+if [[ -s "$ROOT/runtime-cache/direct-py312-torch291-cu128.tar.gz" ]]; then
+  bash "$ROOT/RESTORE_DIRECT_RUNTIME.sh"
+fi
+exec "$ROOT/START_COMFYUI.sh"
+MASHHAD_START_SERVICES
+  chmod +x "$ROOT/start_services.sh"
+}
 echo '[3/7] Hugging Face download environment...'
 venv "$ROOT/.venv-tools"
 if ! "$ROOT/.venv-tools/bin/python" -c 'import huggingface_hub' >/dev/null 2>&1; then
@@ -747,8 +848,12 @@ fi
 echo '[5/7] Selected engine runtime...'
 if (( WANT_DIRECT )); then
   echo "[PARALLEL] Direct Python installation started at $(date -Is)."
-  DIRECT_REPO="$ROOT/LTX-2"
+  DIRECT_REPO="$LOCAL_DIRECT_REPO"
   DIRECT_VENV="$DIRECT_REPO/.venv"
+  if restore_direct_runtime; then
+    echo '[FAST RESTORE] Reused the verified Direct runtime cache; pip install was skipped.'
+  else
+  rm -rf -- "$DIRECT_REPO"
   repo https://github.com/Lightricks/LTX-2.git "$DIRECT_REPO" 2d6e71c88be37b55a2dd698c2dff447edfbe5898
   DIRECT_USE_BASE_TORCH=0
   if python3 - <<'PY'
@@ -783,18 +888,7 @@ PY
     rm -rf -- "$DIRECT_VENV"
     (cd "$DIRECT_REPO"; uv sync --no-dev --extra natten)
   }
-  verify_direct_environment() {
-    "$DIRECT_VENV/bin/python" - <<'PY'
-import natten
-import torch
-import torchaudio
-import torchvision
-from ltx_pipelines import __path__ as ltx_pipelines_path
-
-assert ltx_pipelines_path
-assert torch.version.cuda, torch.version.cuda
-PY
-  }
+  verify_direct_environment() { validate_direct_runtime "$DIRECT_REPO"; }
   verify_direct_fast_environment() {
     verify_direct_environment
     "$DIRECT_VENV/bin/python" - <<'PY'
@@ -804,7 +898,7 @@ assert torch.__version__ == '2.9.1+cu128', torch.__version__
 assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
 PY
   }
-  if [[ "$(cat "$ROOT/.direct-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! verify_direct_environment >/dev/null 2>&1; then
+  if ! verify_direct_environment >/dev/null 2>&1; then
     if (( DIRECT_USE_BASE_TORCH )); then
       echo '[FAST PATH] Installing Direct packages while keeping the base Torch/CUDA runtime.'
       if ! "$DIRECT_VENV/bin/python" -c "import torchvision; assert torchvision.__version__.startswith('0.24.1')" >/dev/null 2>&1; then
@@ -826,10 +920,12 @@ PY
       install_full_direct_environment
       verify_direct_environment
     fi
-    printf '%s\n' "$VERSION" > "$ROOT/.direct-env-version"
-  else
-    echo '[FAST RESUME] Verified Direct environment found; no Python package installation is needed.'
   fi
+  verify_direct_environment
+  cache_direct_runtime
+  fi
+  printf '%s\n' "$VERSION" > "$ROOT/.direct-env-version"
+  write_direct_restore_launcher
   echo '[PARALLEL] Direct Python runtime completed.'
 else
   echo '[SKIP] Direct Python was not selected.'
