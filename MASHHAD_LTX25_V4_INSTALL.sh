@@ -990,7 +990,10 @@ printf '%s\n' "$DEFAULT_ENGINE" > "$ROOT/.mashhad/default_engine"
 printf '%s\n' "$COMFY_AUTO_START" > "$ROOT/.mashhad/comfyui_auto_start"
 printf '%s\n' "$VERSION" > "$ROOT/.MASHHAD_READY_V4"
 echo "INSTALL VERIFIED in $(elapsed)"
-du -sh "$ROOT"
+# Avoid recursively walking the FUSE-backed Network Volume here. Even after a
+# successful install, `du` can spend minutes waiting on metadata for thousands
+# of small files and keeps RunPod reporting the environment as "installing".
+df -hT "$ROOT" || true
 echo "Monitor in another terminal: bash $ROOT/MONITOR_DOWNLOAD.sh"
 if (( WANT_COMFYUI )); then echo "Workflows: $WORKFLOW_DIR"; fi
 echo "Install log: $LOG"
