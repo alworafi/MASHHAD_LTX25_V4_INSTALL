@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mashhad LTX25 V4: selection-aware Direct/ComfyUI installer, no MSR.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V4_LOCAL_RUNTIME_CACHE_20261011'
+VERSION='MASHHAD_LTX25_V4_DUAL_LOCAL_RUNTIME_CACHE_20261011'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -11,6 +11,11 @@ LOCAL_DIRECT_REPO="$LOCAL_RUNTIME_PARENT/LTX-2"
 DIRECT_CACHE_DIR="$ROOT/runtime-cache"
 DIRECT_CACHE="$DIRECT_CACHE_DIR/direct-py312-torch291-cu128.tar.gz"
 DIRECT_CACHE_SHA="$DIRECT_CACHE.sha256"
+LOCAL_COMFY_DIR="$LOCAL_RUNTIME_PARENT/ComfyUI"
+COMFY_CACHE_DIR="$ROOT/runtime-cache"
+COMFY_CACHE="$COMFY_CACHE_DIR/comfyui-py312-torch291-cu128.tar.gz"
+COMFY_CACHE_SHA="$COMFY_CACHE.sha256"
+TOOLS_VENV="$LOCAL_RUNTIME_PARENT/tools-venv"
 elapsed() { local sec=$(($(date +%s)-MASHHAD_START_TS)); printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 format_duration() { local sec="${1:-0}"; printf '%02d:%02d:%02d' "$((sec/3600))" "$(((sec%3600)/60))" "$((sec%60))"; }
 fail() { echo "ERROR: $*" >&2; exit 2; }
@@ -60,18 +65,23 @@ if ((${#MISSING[@]})); then
   apt-get clean
 fi
 echo '[2/7] Persistent Python and packaged helpers...'
-mkdir -p "$RUNTIME"/{bin,python,uv-cache} "$ROOT/mashhad"
+mkdir -p "$RUNTIME"/{bin,python} "$ROOT/mashhad" "$LOCAL_RUNTIME_PARENT/.uv-cache"
 if [[ ! -x "$RUNTIME/bin/uv" ]]; then
   curl -fLsS --retry 4 https://astral.sh/uv/install.sh -o /tmp/mashhad-uv-install.sh
   env UV_UNMANAGED_INSTALL="$RUNTIME/bin" sh /tmp/mashhad-uv-install.sh
 fi
 export PATH="$RUNTIME/bin:$PATH"
-export UV_PYTHON_INSTALL_DIR="$RUNTIME/python"
-export UV_CACHE_DIR="$RUNTIME/uv-cache"
-# The uv cache and persistent environments share one RunPod Volume. Hardlinks
-# avoid copying multi-GB Torch/CUDA trees across the network filesystem.
+export UV_PYTHON_INSTALL_DIR="$LOCAL_RUNTIME_PARENT/python"
+export UV_CACHE_DIR="$LOCAL_RUNTIME_PARENT/.uv-cache"
+# Keep uv's many small cache files on the Pod-local disk too. The finished
+# runtime is archived as one large file on the Network Volume after validation.
 export UV_LINK_MODE=hardlink
-uv python install 3.12
+if python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)' >/dev/null 2>&1; then
+  PYTHON_312="$(command -v python3)"
+else
+  uv python install 3.12
+  PYTHON_312=3.12
+fi
 # Embedded helpers, model manifest and both workflows. No separate GitHub downloads.
 base64 -d <<'MASHHAD_PAYLOAD' | tar -xz -C "$ROOT/mashhad"
 H4sIAJnwvWoC/+29W3PcyJUgrGf+CkzZHlI2UURm4qoezTdsiVLXmhd9JKV2R29HBS4JFlpVQA2A
@@ -491,7 +501,36 @@ eev5F5fCF2fHT4+g8PMjGNnh58dHSVcA1JPjw9bJvvD0kO1T87fOoJXzHVYtGZ3w5RdHrIj1dwj/
 f8IiMBkYT85OL8/h5z5AeX45evXL1sXRvnB43rpgCHl2fnayv8PQCW+c8UbgvdOjpBWGamFqRqAK
 +/3y4mjUoPD06PAY2rpgLzMQh5W3xvz2s/1sP9vP9rP9bD/bz/az/Ww/28+H+fl/QfR0rwBwAwA=
 MASHHAD_PAYLOAD
-cp "$ROOT/mashhad/helpers/START_COMFYUI.sh" "$ROOT/START_COMFYUI_ENGINE.sh"
+cat > "$ROOT/mashhad/comfy_extra_model_paths.yaml" <<MASHHAD_COMFY_MODELS
+mashhad_ltx25:
+  base_path: $ROOT/models/ltx-2.5
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae
+  latent_upscale_models: latent_upscale_models
+  loras: loras
+MASHHAD_COMFY_MODELS
+cat > "$ROOT/START_COMFYUI_ENGINE.sh" <<'MASHHAD_COMFY_ENGINE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
+LOCAL_RUNTIME_PARENT="${MASHHAD_LOCAL_RUNTIME_PARENT:-/opt/mashhad-ltx25}"
+COMFY="$LOCAL_RUNTIME_PARENT/ComfyUI"
+if [[ ! -x "$COMFY/.venv/bin/python" ]]; then
+  bash "$ROOT/RESTORE_COMFY_RUNTIME.sh"
+fi
+[[ -x "$COMFY/.venv/bin/python" && -f "$COMFY/main.py" ]] || {
+  echo 'ComfyUI local runtime is unavailable.' >&2
+  exit 42
+}
+mkdir -p "$ROOT/comfy-user"
+exec "$COMFY/.venv/bin/python" "$COMFY/main.py" \
+  --listen 127.0.0.1 \
+  --port "${COMFYUI_PORT:-8188}" \
+  --disable-auto-launch \
+  --user-directory "$ROOT/comfy-user" \
+  --extra-model-paths-config "$ROOT/mashhad/comfy_extra_model_paths.yaml"
+MASHHAD_COMFY_ENGINE
 cp "$ROOT/mashhad/helpers/MONITOR_DOWNLOAD.sh" "$ROOT/MONITOR_DOWNLOAD.sh"
 cp "$ROOT/mashhad/helpers/DOWNLOAD_DEV_FOR_TRAINING.sh" "$ROOT/DOWNLOAD_DEV_FOR_TRAINING.sh"
 cat > "$ROOT/START_COMFYUI.sh" <<'MASHHAD_START_WRAPPER'
@@ -514,7 +553,7 @@ venv() {
     echo "Rebuilding damaged installer-owned environment: $dir"
     rm -rf -- "$dir"
   fi
-  [[ -x "$dir/bin/python" ]] || uv venv --python 3.12 "$dir"
+  [[ -x "$dir/bin/python" ]] || uv venv --python "$PYTHON_312" "$dir"
 }
 repo() {
   local url="$1" dir="$2" commit="$3"
@@ -574,6 +613,49 @@ cache_direct_runtime() {
   mv -f "$temporary_sha" "$DIRECT_CACHE_SHA"
   echo "[CACHE] Direct runtime archived for future Pods: $DIRECT_CACHE"
 }
+validate_comfy_runtime() {
+  local comfy_dir="${1:-$LOCAL_COMFY_DIR}"
+  [[ -x "$comfy_dir/.venv/bin/python" && -f "$comfy_dir/main.py" ]] || return 1
+  [[ -f "$comfy_dir/custom_nodes/ComfyUI-LTXVideo/__init__.py" ]] || return 1
+  "$comfy_dir/.venv/bin/python" - <<'PY'
+import aiohttp
+import safetensors
+import torch
+import torchaudio
+import torchvision
+import transformers
+import triton
+
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchvision.__version__.startswith('0.24.1'), torchvision.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
+assert triton.__version__ == '3.5.1', triton.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+}
+restore_comfy_runtime() {
+  validate_comfy_runtime "$LOCAL_COMFY_DIR" >/dev/null 2>&1 && return 0
+  [[ -s "$COMFY_CACHE" && -s "$COMFY_CACHE_SHA" ]] || return 1
+  mkdir -p "$LOCAL_RUNTIME_PARENT"
+  (
+    cd "$COMFY_CACHE_DIR"
+    sha256sum -c "$(basename "$COMFY_CACHE_SHA")"
+  ) || return 1
+  rm -rf -- "$LOCAL_COMFY_DIR"
+  tar -xzf "$COMFY_CACHE" -C "$LOCAL_RUNTIME_PARENT"
+  validate_comfy_runtime "$LOCAL_COMFY_DIR"
+}
+cache_comfy_runtime() {
+  local temporary="$COMFY_CACHE.tmp.$$"
+  local temporary_sha="$COMFY_CACHE_SHA.tmp.$$"
+  mkdir -p "$COMFY_CACHE_DIR"
+  rm -f -- "$temporary" "$temporary_sha"
+  tar -czf "$temporary" -C "$LOCAL_RUNTIME_PARENT" ComfyUI
+  printf '%s  %s\n' "$(sha256sum "$temporary" | awk '{print $1}')" "$(basename "$COMFY_CACHE")" > "$temporary_sha"
+  mv -f "$temporary" "$COMFY_CACHE"
+  mv -f "$temporary_sha" "$COMFY_CACHE_SHA"
+  echo "[CACHE] ComfyUI runtime archived for future Pods: $COMFY_CACHE"
+}
 write_direct_restore_launcher() {
   cat > "$ROOT/RESTORE_DIRECT_RUNTIME.sh" <<'MASHHAD_RESTORE_DIRECT'
 #!/usr/bin/env bash
@@ -619,28 +701,83 @@ validate
 echo "[FAST RESTORE] Direct runtime restored to local disk in $(($(date +%s)-started))s."
 MASHHAD_RESTORE_DIRECT
   chmod +x "$ROOT/RESTORE_DIRECT_RUNTIME.sh"
+}
+write_comfy_restore_launcher() {
+  cat > "$ROOT/RESTORE_COMFY_RUNTIME.sh" <<'MASHHAD_RESTORE_COMFY'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
+LOCAL_RUNTIME_PARENT="${MASHHAD_LOCAL_RUNTIME_PARENT:-/opt/mashhad-ltx25}"
+LOCAL_COMFY_DIR="$LOCAL_RUNTIME_PARENT/ComfyUI"
+COMFY_CACHE_DIR="$ROOT/runtime-cache"
+COMFY_CACHE="$COMFY_CACHE_DIR/comfyui-py312-torch291-cu128.tar.gz"
+COMFY_CACHE_SHA="$COMFY_CACHE.sha256"
+validate() {
+  [[ -x "$LOCAL_COMFY_DIR/.venv/bin/python" && -f "$LOCAL_COMFY_DIR/main.py" ]] || return 1
+  [[ -f "$LOCAL_COMFY_DIR/custom_nodes/ComfyUI-LTXVideo/__init__.py" ]] || return 1
+  "$LOCAL_COMFY_DIR/.venv/bin/python" - <<'PY'
+import aiohttp
+import safetensors
+import torch
+import torchaudio
+import torchvision
+import transformers
+import triton
+assert torch.__version__ == '2.9.1+cu128', torch.__version__
+assert torchvision.__version__.startswith('0.24.1'), torchvision.__version__
+assert torchaudio.__version__ == '2.9.1+cu128', torchaudio.__version__
+assert triton.__version__ == '3.5.1', triton.__version__
+assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
+PY
+}
+if validate >/dev/null 2>&1; then
+  echo '[FAST RESTORE] ComfyUI runtime is already ready on local disk.'
+  exit 0
+fi
+[[ -s "$COMFY_CACHE" && -s "$COMFY_CACHE_SHA" ]] || {
+  echo "ComfyUI runtime cache is missing: $COMFY_CACHE" >&2
+  exit 41
+}
+mkdir -p "$LOCAL_RUNTIME_PARENT"
+(
+  cd "$COMFY_CACHE_DIR"
+  sha256sum -c "$(basename "$COMFY_CACHE_SHA")"
+)
+rm -rf -- "$LOCAL_COMFY_DIR"
+started=$(date +%s)
+tar -xzf "$COMFY_CACHE" -C "$LOCAL_RUNTIME_PARENT"
+validate
+echo "[FAST RESTORE] ComfyUI runtime restored to local disk in $(($(date +%s)-started))s."
+MASHHAD_RESTORE_COMFY
+  chmod +x "$ROOT/RESTORE_COMFY_RUNTIME.sh"
+}
+write_start_services_launcher() {
   cat > "$ROOT/start_services.sh" <<'MASHHAD_START_SERVICES'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
-if [[ -s "$ROOT/runtime-cache/direct-py312-torch291-cu128.tar.gz" ]]; then
+DEFAULT_ENGINE="$(cat "$ROOT/.mashhad/default_engine" 2>/dev/null || printf direct)"
+if [[ "$DEFAULT_ENGINE" == direct && -s "$ROOT/runtime-cache/direct-py312-torch291-cu128.tar.gz" ]]; then
   bash "$ROOT/RESTORE_DIRECT_RUNTIME.sh"
+fi
+if [[ "$DEFAULT_ENGINE" == comfyui && -s "$ROOT/runtime-cache/comfyui-py312-torch291-cu128.tar.gz" ]]; then
+  bash "$ROOT/RESTORE_COMFY_RUNTIME.sh"
 fi
 exec "$ROOT/START_COMFYUI.sh"
 MASHHAD_START_SERVICES
   chmod +x "$ROOT/start_services.sh"
 }
 echo '[3/7] Hugging Face download environment...'
-venv "$ROOT/.venv-tools"
-if ! "$ROOT/.venv-tools/bin/python" -c 'import huggingface_hub' >/dev/null 2>&1; then
-  uv pip install --python "$ROOT/.venv-tools/bin/python" huggingface_hub==1.33.0
+venv "$TOOLS_VENV"
+if ! "$TOOLS_VENV/bin/python" -c 'import huggingface_hub' >/dev/null 2>&1; then
+  uv pip install --python "$TOOLS_VENV/bin/python" huggingface_hub==1.33.0
 fi
 export HF_HOME="$ROOT/.hf-cache"
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_DOWNLOAD_TIMEOUT=120
 export HF_HUB_ETAG_TIMEOUT=30
 SELECTED_MODEL_MANIFEST="$ROOT/mashhad/helpers/models.selected.json"
-"$ROOT/.venv-tools/bin/python" - "$ROOT/mashhad/helpers/models.json" "$SELECTED_MODEL_MANIFEST" "$PREPARE_MODE" <<'PY'
+"$TOOLS_VENV/bin/python" - "$ROOT/mashhad/helpers/models.json" "$SELECTED_MODEL_MANIFEST" "$PREPARE_MODE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -703,10 +840,16 @@ trap 'echo "Terminated; stopping parallel tasks..."; exit 143' TERM
 
 PARALLEL_START_TS=$(date +%s)
 echo '[4/7] Parallel model download and selected engine runtime...'
-COMFY="$ROOT/ComfyUI"
-# models.py may create zero-copy compatibility links after downloading. Prepare
-# the ComfyUI repository shell only when that runtime was explicitly selected.
+COMFY="$LOCAL_COMFY_DIR"
+COMFY_RESTORED=0
+# Restore ComfyUI to the Pod-local disk before any Git or pip work. A fresh
+# Network Volume has no cache, so it falls through to a local build while the
+# model downloader continues in parallel.
 if (( WANT_COMFYUI )); then
+  if restore_comfy_runtime; then
+    COMFY_RESTORED=1
+    echo '[FAST RESTORE] Reused the verified ComfyUI runtime cache; pip install was skipped.'
+  fi
   if [[ ! -d "$COMFY/.git" ]]; then
     if [[ -e "$COMFY" ]] && find "$COMFY" -mindepth 1 -maxdepth 1 ! -name models -print -quit | grep -q .; then
       fail "$COMFY exists but is not a Git repository; move it manually before retrying."
@@ -724,7 +867,7 @@ MODEL_RUN_ID=$(date +%Y%m%d_%H%M%S)
 MODEL_LOG="$ROOT/logs/models_download_${MODEL_RUN_ID}.log"
 MODEL_STATUS_FILE="$ROOT/logs/.models_download_${MODEL_RUN_ID}.status"
 rm -f -- "$MODEL_STATUS_FILE" "$MODEL_STATUS_FILE".tmp.*
-"$ROOT/.venv-tools/bin/python" -u -c '
+"$TOOLS_VENV/bin/python" -u -c '
 import os
 import runpy
 import sys
@@ -764,9 +907,10 @@ echo "[PARALLEL] Model download log: $MODEL_LOG"
 COMFY_START_TS=$(date +%s)
 if (( WANT_COMFYUI )); then
 echo "[PARALLEL] ComfyUI installation started at $(date -Is)."
+if (( ! COMFY_RESTORED )); then
 repo https://github.com/comfyanonymous/ComfyUI.git "$COMFY" 651ca296a73cd21c12a57eb8741d52e40dc6528f
 repo https://github.com/Lightricks/ComfyUI-LTXVideo.git "$COMFY/custom_nodes/ComfyUI-LTXVideo" bf2ca0264f706db64cb8931155695ca481fc9d91
-COMFY_VENV="$ROOT/.venv-comfy"
+COMFY_VENV="$COMFY/.venv"
 COMFY_USE_BASE_TORCH=0
 if python3 - <<'PY'
 import sys
@@ -816,7 +960,7 @@ assert triton.__version__ == '3.5.1', triton.__version__
 assert (torch.version.cuda or '').startswith('12.8'), torch.version.cuda
 PY
 }
-if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! "$ROOT/.venv-comfy/bin/python" -c 'import torch, torchvision, torchaudio, aiohttp, safetensors, transformers' >/dev/null 2>&1; then
+if [[ "$(cat "$COMFY/.mashhad-env-version" 2>/dev/null || true)" != "$VERSION" ]] || ! "$COMFY_VENV/bin/python" -c 'import torch, torchvision, torchaudio, aiohttp, safetensors, transformers' >/dev/null 2>&1; then
   if (( COMFY_USE_BASE_TORCH )); then
     COMFY_FAST_LOCK="$ROOT/mashhad/helpers/comfy_requirements.no-base-torch.lock"
     grep -Ev '^(torch|torchaudio|torchvision|triton|nvidia-[^=]+)==' "$ROOT/mashhad/helpers/comfy_requirements.lock" > "$COMFY_FAST_LOCK"
@@ -837,8 +981,12 @@ if [[ "$(cat "$ROOT/.comfy-env-version" 2>/dev/null || true)" != "$VERSION" ]] |
     install_full_comfy_environment
     verify_comfy_environment
   fi
-  printf '%s\n' "$VERSION" > "$ROOT/.comfy-env-version"
+  printf '%s\n' "$VERSION" > "$COMFY/.mashhad-env-version"
 fi
+validate_comfy_runtime "$COMFY"
+cache_comfy_runtime
+fi
+write_comfy_restore_launcher
 COMFY_END_TS=$(date +%s)
 echo "[PARALLEL] ComfyUI completed in $(format_duration "$((COMFY_END_TS-COMFY_START_TS))")."
 else
@@ -931,6 +1079,8 @@ else
   echo '[SKIP] Direct Python was not selected.'
 fi
 
+write_start_services_launcher
+
 if (( WANT_COMFYUI )); then
   echo '[6/7] Synchronize model download and create ComfyUI links...'
 else
@@ -969,7 +1119,7 @@ PARALLEL_END_TS=$(date +%s)
 echo "[PARALLEL] Both parallel tasks completed in $(format_duration "$((PARALLEL_END_TS-PARALLEL_START_TS))")."
 echo '[7/7] Workflow installation and validation...'
 echo '[VALIDATION] Starting final validation...'
-WORKFLOW_DIR="$COMFY/user/default/workflows/Mashhad"
+WORKFLOW_DIR="$ROOT/comfy-user/default/workflows/Mashhad"
 if (( WANT_COMFYUI )); then
   mkdir -p "$WORKFLOW_DIR"
   for workflow in "$ROOT/mashhad/workflows/"*.json; do
@@ -980,7 +1130,7 @@ if (( WANT_COMFYUI )); then
     cp "$workflow" "$WORKFLOW_DIR/$name"
   done
 fi
-"$ROOT/.venv-tools/bin/python" "$ROOT/mashhad/helpers/models.py" --check --manifest "$SELECTED_MODEL_MANIFEST"
+"$TOOLS_VENV/bin/python" "$ROOT/mashhad/helpers/models.py" --check --manifest "$SELECTED_MODEL_MANIFEST"
 mkdir -p "$ROOT/.mashhad/engines"
 rm -f -- "$ROOT/.mashhad/engines/direct.ready" "$ROOT/.mashhad/engines/comfyui.ready"
 if (( WANT_DIRECT )); then printf '%s\n' "$VERSION" > "$ROOT/.mashhad/engines/direct.ready"; fi
