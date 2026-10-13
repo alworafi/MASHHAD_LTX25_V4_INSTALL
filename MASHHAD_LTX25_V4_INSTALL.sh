@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Mashhad LTX25 V6: selection-aware Direct/ComfyUI installer with optional cached LoRA training runtime.
+# Mashhad LTX25 V7: clean service handoff plus cached LoRA training runtime.
 set -Eeuo pipefail
-VERSION='MASHHAD_LTX25_V6_TRAINING_PARALLEL_LOCAL_CACHE_20261012'
+VERSION='MASHHAD_LTX25_V7_SERVICE_HANDOFF_TRAINING_CACHE_20261013'
 export MASHHAD_ROOT="${MASHHAD_ROOT:-/workspace/LTX25}"
 ROOT="$MASHHAD_ROOT"
 export MASHHAD_START_TS="${MASHHAD_START_TS:-$(date +%s)}"
@@ -543,10 +543,30 @@ DEFAULT_ENGINE="$(cat "$ROOT/.mashhad/default_engine" 2>/dev/null || printf dire
 COMFY_AUTO_START="$(cat "$ROOT/.mashhad/comfyui_auto_start" 2>/dev/null || printf 0)"
 if [[ -f "$ROOT/.mashhad/engines/comfyui.ready" ]] \
   && { [[ "$DEFAULT_ENGINE" == comfyui ]] || [[ "$COMFY_AUTO_START" == 1 ]]; }; then
-  exec "$ROOT/START_COMFYUI_ENGINE.sh"
+  PID_FILE="$ROOT/.mashhad/comfyui.pid"
+  LOG_FILE="$ROOT/.mashhad/comfyui.log"
+  if [[ -f "$PID_FILE" ]]; then
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ "$OLD_PID" =~ ^[0-9]+$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "ComfyUI is already running (PID $OLD_PID)."
+      exit 0
+    fi
+  fi
+  nohup "$ROOT/START_COMFYUI_ENGINE.sh" > "$LOG_FILE" 2>&1 </dev/null &
+  echo $! > "$PID_FILE"
+  for attempt in $(seq 1 90); do
+    if curl -fsS --max-time 3 http://127.0.0.1:${COMFYUI_PORT:-8188}/system_stats >/dev/null 2>&1; then
+      echo "ComfyUI started in the background on port ${COMFYUI_PORT:-8188} (PID $(cat "$PID_FILE"))."
+      exit 0
+    fi
+    sleep 2
+  done
+  echo 'ComfyUI did not pass its local health endpoint.' >&2
+  tail -n 120 "$LOG_FILE" >&2 || true
+  exit 31
 fi
 echo "Mashhad environment is installed; ComfyUI auto-start is disabled for engine: $DEFAULT_ENGINE"
-exec tail -f /dev/null
+exit 0
 MASHHAD_START_WRAPPER
 chmod +x "$ROOT/START_COMFYUI.sh" "$ROOT/START_COMFYUI_ENGINE.sh" "$ROOT/MONITOR_DOWNLOAD.sh" "$ROOT/DOWNLOAD_DEV_FOR_TRAINING.sh"
 venv() {
@@ -1159,8 +1179,7 @@ if (( WANT_COMFYUI )); then echo "Workflows: $WORKFLOW_DIR"; fi
 echo "Install log: $LOG"
 if [[ "${MASHHAD_INSTALL_ONLY:-0}" == 1 ]]; then
   echo 'INSTALL ONLY complete. For generation: use a GPU pod on this volume and set MASHHAD_INSTALL_ONLY=0.'
-  # Keep the template container alive; interrupt with Ctrl+C when run manually.
-  tail -f /dev/null
 else
-  exec "$ROOT/START_COMFYUI.sh"
+  "$ROOT/START_COMFYUI.sh"
 fi
+echo 'INSTALLER EXITED CLEANLY; the Pod entrypoint can now keep the container alive.'
